@@ -16,7 +16,7 @@ import operator
 import re
 import tokenize
 import types
-from collections import deque
+from collections import deque, defaultdict
 from collections.abc import Callable, Generator, Hashable, Iterable, Iterator, Mapping
 from fractions import Fraction
 from functools import lru_cache, partial
@@ -411,6 +411,44 @@ def find_connected_nodes(
             find_connected_nodes(graph, node, visited)
 
     return visited
+
+
+def split_graph_components(graph: dict[TH, set[TH]]) -> dict[dict[TH, set[TH]]]: 
+    # Convert to undirected graph for component detection
+    # Is is this necessary?
+    undirected = defaultdict(set)
+    for node, neighbors in graph.items():
+        for neighbor in neighbors:
+            undirected[node].add(neighbor)
+            undirected[neighbor].add(node)
+
+    # Find connected components using BFS
+    visited = set()
+    components = {}
+    component_id = 1
+
+    for node in graph:
+        if node not in visited:
+            queue = deque([node])
+            component_nodes = set()
+            visited.add(node)
+
+            while queue:
+                current = queue.popleft()
+                component_nodes.add(current)
+                for neighbor in undirected[current]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+
+            # Build the component subgraph using original graph directions
+            component_graph = {
+                n: graph[n] for n in component_nodes if n in graph
+            }
+            components[component_id] = component_graph
+            component_id += 1
+
+    return components
 
 
 class udict(dict[str, Scalar]):

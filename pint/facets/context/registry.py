@@ -17,10 +17,12 @@ from typing import Any, Generic
 from ..._typing import F, Magnitude
 from ...compat import TypeAlias
 from ...errors import UndefinedUnitError
-from ...util import UnitsContainer, find_connected_nodes, find_shortest_path, logger
+from ...util import UnitsContainer, find_connected_nodes, find_shortest_path, split_graph_components, logger
 from ..plain import GenericPlainRegistry, QuantityT, UnitDefinition, UnitT
 from . import objects
 from .definitions import ContextDefinition
+
+from math import copysign
 
 # TODO: Put back annotation when possible
 # registry_cache: "RegistryCache"
@@ -399,13 +401,109 @@ class GenericContextRegistry(
             src_dim = self._get_dimensionality(src)
             dst_dim = self._get_dimensionality(dst)
 
-            path = find_shortest_path(self._active_ctx.graph, src_dim, dst_dim)
-            if path:
-                src = self.Quantity(value, src)
-                for a, b in zip(path[:-1], path[1:]):
-                    src = self._active_ctx.transform(a, b, self, src, **ctx_kwargs)
+            # find_shortest_path will fail if units with a transformation within
+            # a context are combined with units without a transformation. For
+            # example in spectroscopic context:
+            # Quantity(5, 'Hz/mm').to('nm/mm', 'sp')
+            # would usually fail, because the mm is not contained in the
+            # transformation paths. The following block removes common dimensions
+            # to src_dim and dst_dim - in the example case, the common dimension
+            # of 1 [length] is removed.
+            intersect = src_dim.keys() & dst_dim.keys()
+            to_remove = []
+            while intersect:
+                common_dim = intersect.pop()
+                if src_dim[common_dim] == dst_dim[common_dim]:
+                    to_remove.append(common_dim)
+            src_dim, dst_dim = src_dim.remove(to_remove), dst_dim.remove(to_remove)
 
-                value, src = src._magnitude, src._units
+            # code for dealing with compound units
+            ctx_subgraphs = split_graph_components(self._active_ctx.graph)
+            _src_dim, _dst_dim = dict(src_dim), dict(dst_dim)
+            pairs = []
+
+
+            # for each "base" dimension in source dimensions (i.e. without exponents)
+            while _src_dim:
+                base_sd = next(iter(_src_dim)) 
+                # find subgraph containing base_sd
+                for subgraph in ctx_subgraphs.values(): # the graph should never be empty, so this should never fail
+
+                    # make sets of nodes with incoming and outgoing edges, and of the base dimensions in the subgraph
+                    subgraph_in, subgraph_out, subgraph_base_dims = set(), set(), set()
+                    for node, targets in subgraph.items():
+                        subgraph_in.add(node)
+                        subgraph_base_dims.add(next(iter(node)))
+                        for target in targets:
+                            subgraph_out.add(target)
+                            subgraph_base_dims.add(next(iter(target)))
+                    
+                    
+
+                    if base_sd in subgraph_base_dims:
+                        # find the highest exponent of base_sd that is in the subgraph
+                        exp_src = _src_dim[base_sd]
+                        sign_src = int(copysign(1, _src_dim[base_sd]))
+                        while exp_src != 0:
+                            if UnitsContainer({base_sd:exp_src}) in subgraph_in:
+                                break
+                            # if not, reduce exponent by 1 and try again
+                            else:
+                                exp_src -= sign_src
+                        else:
+                            # continue to next subgraph if the dimension isn't in this subgraph with this sign
+                            continue
+
+                        # do the same for destination dimensions
+                        # loop through all candidate destination base dimensions - must come from same subgraph
+                        for base_dd in subgraph_base_dims:
+                            if base_dd != base_sd and base_dd in _dst_dim:
+                                # find the highest exponent of base_sd that is in the subgraph
+                                exp_dst = _dst_dim[base_dd]
+                                sign_dst = int(copysign(1, _dst_dim[base_dd]))
+                                while exp_dst != 0:
+                                    if UnitsContainer({base_dd:exp_dst}) in subgraph_out:
+                                        break
+                                    # if not, reduce exponent by 1 and try again
+                                    else:
+                                        exp_dst -= sign_dst
+                                else:
+                                    # continue to next base_dd if the dimension isn't in this subgraph with this sign
+                                    continue
+
+                                # add found pair of units and exponents to pairs
+                                pairs.append((UnitsContainer({base_sd:exp_src}), UnitsContainer({base_dd:exp_dst})))
+                                # remove the handled dimensions from _src_dim and _dst_dim
+                                _src_dim[base_sd] -= exp_src
+                                _dst_dim[base_dd] -= exp_dst
+                                # delete dimensions if the exponent is now zero
+                                if _src_dim[base_sd] == 0:
+                                    del _src_dim[base_sd]
+                                if _dst_dim[base_dd] == 0:
+                                    del _dst_dim[base_dd]
+                                break
+                        else:
+                            continue
+                        break
+                    else:
+                        continue
+                else:
+                    # put None in pairs if the source unit is not in any subgraph
+                    pairs.append((None, None))
+                    break
+
+
+            # paths for each pair of source and destination dimension
+            paths = [find_shortest_path(self._active_ctx.graph, s, d) for s, d in pairs]
+            src = self.Quantity(value, src)
+            for path in paths:
+                if not path:
+                    break
+                else:
+                    for a, b in zip(path[:-1], path[1:]):
+                        src = self._active_ctx.transform(a, b, self, src, **ctx_kwargs)
+            
+            value, src = src._magnitude, src._units
 
         return super()._convert(value, src, dst, inplace, **ctx_kwargs)
 
